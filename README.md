@@ -2,6 +2,8 @@
 
 This project contains Python scripts (`data_collector.py`, `api_client.py`) for collecting real-time cryptocurrency trade and price data from the ASTER exchange using websockets.
 
+Referral link to support this work: [https://www.asterdex.com/en/referral/164f81](https://www.asterdex.com/en/referral/164f81)
+
 ## Usage
 
 To collect data, run the `data_collector.py` script:

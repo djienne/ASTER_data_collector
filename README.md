@@ -14,6 +14,8 @@ python data_collector.py
 
 The script will connect to the ASTER exchange via websockets to stream and save trade and price data.
 
+Update the `LIST_MARKETS` variable at the top of `data_collector.py` (e.g., `LIST_MARKETS = ['ASTERUSDT', 'BTCUSDT', 'ETHUSDT', 'USD1USDT']`) to specify which markets should be collected.
+
 ## Data
 
 The script generates the following data files in the `ASTER_data/` directory:

@@ -12,9 +12,10 @@ from collections import deque
 LIST_MARKETS = ['ASTERUSDT', 'BTCUSDT', 'ETHUSDT', 'USD1USDT']
 
 class WebSocketDataCollector:
-    def __init__(self, symbols, flush_interval=5):
+    def __init__(self, symbols, flush_interval=5, order_book_levels=10):
         self.symbols = [symbol.upper() for symbol in symbols]
         self.flush_interval = flush_interval
+        self.order_book_levels = order_book_levels
         self.base_url = "wss://fstream.asterdex.com"
         self.api_base_url = "https://fapi.asterdex.com"
 
@@ -30,7 +31,8 @@ class WebSocketDataCollector:
         self.ping_interval = 30
 
         # Data buffers
-        self.prices_buffer = {}  # symbol -> deque of price records
+        self.prices_buffer = {}  # symbol -> deque of price records (bid/ask/mid)
+        self.orderbook_buffer = {}  # symbol -> deque of full order book records
         self.trades_buffer = {}  # symbol -> deque of trade records
         self.seen_trade_ids = {}  # symbol -> set of seen trade IDs
 
@@ -41,6 +43,7 @@ class WebSocketDataCollector:
         # Initialize buffers and load existing trade IDs
         for symbol in self.symbols:
             self.prices_buffer[symbol] = deque()
+            self.orderbook_buffer[symbol] = deque()
             self.trades_buffer[symbol] = deque()
             self.seen_trade_ids[symbol] = self.load_seen_trade_ids(symbol)
 
@@ -105,6 +108,30 @@ class WebSocketDataCollector:
             print(f"Error getting initial prices for {symbol}: {e}")
             return None
 
+    def get_initial_orderbook_api(self, symbol):
+        """Get initial order book data via API to establish baseline."""
+        endpoint = f"{self.api_base_url}/fapi/v1/depth"
+        params = {'symbol': symbol, 'limit': self.order_book_levels}
+
+        try:
+            response = requests.get(endpoint, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            timestamp = time.time()
+            bids = [[float(bid[0]), float(bid[1])] for bid in data.get('bids', [])[:self.order_book_levels]]
+            asks = [[float(ask[0]), float(ask[1])] for ask in data.get('asks', [])[:self.order_book_levels]]
+
+            return {
+                'timestamp': timestamp,
+                'bids': bids,
+                'asks': asks,
+                'lastUpdateId': data.get('lastUpdateId')
+            }
+        except Exception as e:
+            print(f"Error getting initial order book for {symbol}: {e}")
+            return None
+
     def get_initial_trades_api(self, symbol):
         """Get initial trade data via API to establish baseline."""
         endpoint = f"{self.api_base_url}/fapi/v1/trades"
@@ -148,21 +175,45 @@ class WebSocketDataCollector:
                 asks = data.get('a', [])
 
                 if bids and asks:
-                    # Get best bid and ask
-                    best_bid = float(bids[0][0])
-                    best_ask = float(asks[0][0])
-                    mid = (best_bid + best_ask) / 2
                     timestamp = time.time()
 
-                    price_record = {
-                        'timestamp': timestamp,
-                        'bid': best_bid,
-                        'ask': best_ask,
-                        'mid': mid
-                    }
+                    # Process bids and asks up to the specified levels
+                    processed_bids = []
+                    processed_asks = []
 
-                    with self.lock:
-                        self.prices_buffer[symbol].append(price_record)
+                    for i, bid in enumerate(bids[:self.order_book_levels]):
+                        if len(bid) >= 2:
+                            processed_bids.append([float(bid[0]), float(bid[1])])
+
+                    for i, ask in enumerate(asks[:self.order_book_levels]):
+                        if len(ask) >= 2:
+                            processed_asks.append([float(ask[0]), float(ask[1])])
+
+                    # Get best bid and ask for price record
+                    if processed_bids and processed_asks:
+                        best_bid = processed_bids[0][0]
+                        best_ask = processed_asks[0][0]
+                        mid = (best_bid + best_ask) / 2
+
+                        # Store simple price data (for compatibility)
+                        price_record = {
+                            'timestamp': timestamp,
+                            'bid': best_bid,
+                            'ask': best_ask,
+                            'mid': mid
+                        }
+
+                        # Store full order book data
+                        orderbook_record = {
+                            'timestamp': timestamp,
+                            'bids': processed_bids,
+                            'asks': processed_asks,
+                            'lastUpdateId': data.get('u')  # final update ID
+                        }
+
+                        with self.lock:
+                            self.prices_buffer[symbol].append(price_record)
+                            self.orderbook_buffer[symbol].append(orderbook_record)
 
         except json.JSONDecodeError:
             pass
@@ -233,7 +284,17 @@ class WebSocketDataCollector:
 
     def create_combined_stream_url(self):
         """Create combined stream URL for all symbols."""
-        depth_streams = [f"{symbol.lower()}@depth5" for symbol in self.symbols]
+        # Use appropriate depth stream based on order book levels
+        if self.order_book_levels <= 5:
+            depth_suffix = "depth5"
+        elif self.order_book_levels <= 10:
+            depth_suffix = "depth10"
+        elif self.order_book_levels <= 20:
+            depth_suffix = "depth20"
+        else:
+            depth_suffix = "depth20"  # Max available via WebSocket
+
+        depth_streams = [f"{symbol.lower()}@{depth_suffix}" for symbol in self.symbols]
         trade_streams = [f"{symbol.lower()}@aggTrade" for symbol in self.symbols]
         all_streams = depth_streams + trade_streams
 
@@ -310,6 +371,9 @@ class WebSocketDataCollector:
                 if self.prices_buffer[symbol]:
                     self.flush_prices_buffer(symbol)
 
+                if self.orderbook_buffer[symbol]:
+                    self.flush_orderbook_buffer(symbol)
+
                 if self.trades_buffer[symbol]:
                     self.flush_trades_buffer(symbol)
 
@@ -340,6 +404,55 @@ class WebSocketDataCollector:
 
         except Exception as e:
             print(f"Error flushing prices for {symbol}: {e}")
+
+    def flush_orderbook_buffer(self, symbol):
+        """Flush order book buffer for a specific symbol."""
+        file_path = os.path.join('ASTER_data', f'orderbook_{symbol}.csv')
+        file_exists = os.path.isfile(file_path)
+
+        try:
+            with open(file_path, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                if not file_exists:
+                    # Create header with bid/ask levels
+                    header = ['unix_timestamp', 'lastUpdateId']
+                    for i in range(self.order_book_levels):
+                        header.extend([f'bid_price_{i}', f'bid_qty_{i}'])
+                    for i in range(self.order_book_levels):
+                        header.extend([f'ask_price_{i}', f'ask_qty_{i}'])
+                    writer.writerow(header)
+
+                count = 0
+                while self.orderbook_buffer[symbol]:
+                    record = self.orderbook_buffer[symbol].popleft()
+
+                    # Prepare row data
+                    row = [record['timestamp'], record.get('lastUpdateId', '')]
+
+                    # Add bid data
+                    bids = record.get('bids', [])
+                    for i in range(self.order_book_levels):
+                        if i < len(bids):
+                            row.extend([f"{bids[i][0]:.6f}", f"{bids[i][1]:.6f}"])
+                        else:
+                            row.extend(['', ''])  # Empty if no data at this level
+
+                    # Add ask data
+                    asks = record.get('asks', [])
+                    for i in range(self.order_book_levels):
+                        if i < len(asks):
+                            row.extend([f"{asks[i][0]:.6f}", f"{asks[i][1]:.6f}"])
+                        else:
+                            row.extend(['', ''])  # Empty if no data at this level
+
+                    writer.writerow(row)
+                    count += 1
+
+                if count > 0:
+                    print(f"Flushed {count} order book records for {symbol}")
+
+        except Exception as e:
+            print(f"Error flushing order book for {symbol}: {e}")
 
     def flush_trades_buffer(self, symbol):
         """Flush trades buffer for a specific symbol."""
@@ -395,6 +508,13 @@ class WebSocketDataCollector:
                     self.prices_buffer[symbol].append(initial_price)
                 print(f"  Initial price: ${initial_price['mid']:.2f}")
 
+            # Get initial order book data
+            initial_orderbook = self.get_initial_orderbook_api(symbol)
+            if initial_orderbook:
+                with self.lock:
+                    self.orderbook_buffer[symbol].append(initial_orderbook)
+                print(f"  Initial order book: {len(initial_orderbook['bids'])} bids, {len(initial_orderbook['asks'])} asks")
+
             # Get initial trade data
             initial_trades = self.get_initial_trades_api(symbol)
             if initial_trades:
@@ -447,9 +567,11 @@ if __name__ == "__main__":
                         help='The trading symbols to collect data for (e.g., BTCUSDT ETHUSDT).')
     parser.add_argument('--flush-interval', type=int, default=5,
                         help='The interval in seconds to flush buffers to CSV files. Defaults to 5.')
+    parser.add_argument('--order-book-levels', type=int, default=10,
+                        help='Number of order book levels to collect (5, 10, or 20). Defaults to 10.')
     args = parser.parse_args()
 
-    collector = WebSocketDataCollector(args.symbols, args.flush_interval)
+    collector = WebSocketDataCollector(args.symbols, args.flush_interval, args.order_book_levels)
 
     try:
         collector.start()
